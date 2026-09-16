@@ -99,6 +99,17 @@ class ConfigurationTests(unittest.TestCase):
             timeout=45, max_retries=0,
         )
 
+    def test_client_ignores_generic_openai_account_variables(self):
+        # The SDK constructor would read these from the environment and send them as headers.
+        generic = {"OPENAI_ORG_ID": "org-x", "OPENAI_PROJECT_ID": "proj-x", "OPENAI_CUSTOM_HEADERS": "X-A=1"}
+        seen = {}
+        def constructor(**kwargs):
+            seen.update({name: os.environ.get(name) for name in generic})
+            return SimpleNamespace()
+        with patch.dict(os.environ, dict(ENV, **generic), clear=True), patch("openai.OpenAI", side_effect=constructor):
+            imagegen.build_client(imagegen.read_config(), 45)
+        self.assertEqual(seen, {name: None for name in generic})
+
 
 class RequestTests(unittest.TestCase):
     def test_real_sdk_serialization_with_mock_transport(self):
@@ -194,9 +205,10 @@ class ArtifactTests(unittest.TestCase):
         # Paid output is kept; the deviation is reported on stderr.
         for image_format, size in (("jpeg", None), ("png", "1024x1024")):
             stderr = StringIO()
-            with self.subTest(image_format=image_format, size=size), contextlib.redirect_stderr(stderr):
-                self.assertEqual(extract(response_for(), image_format, size), image_bytes())
-            self.assertIn("IMAGE_GENERATION_WARNING", stderr.getvalue())
+            with self.subTest(image_format=image_format, size=size):
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(extract(response_for(), image_format, size), image_bytes())
+                self.assertIn("IMAGE_GENERATION_WARNING", stderr.getvalue())
 
     def test_requested_size_accepted(self):
         data = image_bytes(size=(1024, 1024))
@@ -223,7 +235,7 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(imagegen.GenerationError, "Model text: I can't draw that. Policy."):
             extract(response)
 
-    def test_missing_failed_pending_and_multiple_calls(self):
+    def test_missing_failed_and_pending_responses_raise(self):
         good = response_for()
         responses = [
             SimpleNamespace(status="completed", output=[]),
@@ -331,10 +343,16 @@ class CommandTests(unittest.TestCase):
             error = APIStatusError(secret, response=httpx.Response(status, request=request), body={"key": secret})
             with self.subTest(status=status):
                 self.assertNotIn(secret, imagegen.safe_error(error))
+                self.assertIn(f"HTTP {status}", imagegen.safe_error(error))
+        # Structured code/type is surfaced; free-text message never is.
+        body = {"error": {"type": "invalid_request_error", "code": "unsupported_content", "message": secret}}
+        error = APIStatusError(secret, response=httpx.Response(422, request=request), body=body)
+        self.assertIn("HTTP 422, invalid_request_error/unsupported_content", imagegen.safe_error(error))
+        self.assertNotIn(secret, imagegen.safe_error(error))
         self.assertIn("timed out", imagegen.safe_error(APITimeoutError(request=request)))
         self.assertIn("Could not reach", imagegen.safe_error(APIConnectionError(message=secret, request=request)))
 
-    def test_bad_timeout_and_empty_prompt(self):
+    def test_invalid_arguments_rejected(self):
         for args in (["--timeout", "0", "test"], ["--timeout", "nan", "test"], ["--timeout", "inf", "test"], ["  "], ["--input-fidelity", "high", "test"]):
             with self.subTest(args=args), contextlib.redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 imagegen.parse_args(args)

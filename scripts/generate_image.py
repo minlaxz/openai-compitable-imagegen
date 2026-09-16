@@ -95,6 +95,10 @@ def build_client(config: Config, timeout: float) -> Any:
     # SDK debug logging can expose prompts and reference images.
     for name in ("openai", "httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
+    # The SDK constructor reads these from the environment and sends them as
+    # headers; they belong to unrelated OpenAI accounts, not this endpoint.
+    for name in ("OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "OPENAI_WEBHOOK_SECRET", "OPENAI_CUSTOM_HEADERS"):
+        os.environ.pop(name, None)
     return OpenAI(
         api_key=config.api_key,
         base_url=config.base_url,
@@ -193,7 +197,7 @@ def select_call(response: Any) -> Any:
     if not completed:
         raise GenerationError("No image-generation call completed with Base64 image data. No image was saved.")
     if len(calls) > 1:
-        warn(f"The model made {len(calls)} image calls; only the first completed one was saved.")
+        warn(f"The model made {len(calls)} image calls; only the first completed one is used.")
     return completed[0]
 
 
@@ -238,7 +242,7 @@ def safe_error(exc: Exception) -> str:
     if isinstance(exc, GenerationError):
         return str(exc)
     if isinstance(exc, ImportError):
-        return "Missing a dependency. Install the skill's requirements.txt in the selected Python environment."
+        return "Missing a dependency. Run with `uv run`, or install requirements.txt in the selected Python environment."
     if isinstance(exc, OSError):
         return "A local file operation failed. Check paths, permissions, and available disk space."
     try:
@@ -257,8 +261,23 @@ def safe_error(exc: Exception) -> str:
             404: "Endpoint or model not found. Check OPENAI_IMAGE_BASE_URL and OPENAI_IMAGE_MODEL.",
             429: "The endpoint rate limit or quota was exceeded. No automatic retry was made.",
         }
-        return messages.get(exc.status_code, "The endpoint returned an API error. No automatic retry was made.")
+        message = messages.get(exc.status_code, "The endpoint returned an API error. No automatic retry was made.")
+        return f"{message} (HTTP {exc.status_code}{error_code(exc)})"
     return "Image generation failed. No upstream error details were printed."
+
+
+def error_code(exc: Any) -> str:
+    """Short structured error code/type from the upstream body, never its free-text message."""
+    body = getattr(exc, "body", None)
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    parts = []
+    for key in ("type", "code"):
+        value = error.get(key)
+        if isinstance(value, str) and 0 < len(value) <= 64 and value.replace("_", "").replace("-", "").replace(".", "").isalnum():
+            parts.append(value)
+    return ", " + "/".join(parts) if parts else ""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -278,7 +297,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("a nonempty prompt is required unless --check-config is used")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be a finite positive number")
-    if args.input_fidelity and not args.image:
+    if not args.check_config and args.input_fidelity and not args.image:
         parser.error("--input-fidelity requires at least one --image")
     return args
 
