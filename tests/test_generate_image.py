@@ -33,6 +33,10 @@ def image_bytes(image_format="PNG", size=(8, 8)):
     return stream.getvalue()
 
 
+def extract(response, image_format="png", size=None):
+    return imagegen.decode_image(imagegen.select_call(response), image_format, size)
+
+
 def response_for(data=None, **call_changes):
     call = {
         "type": "image_generation_call",
@@ -120,7 +124,7 @@ class RequestTests(unittest.TestCase):
             http_client=httpx.Client(transport=httpx.MockTransport(handle)),
         ) as client:
             response = imagegen.create_request(client, config, imagegen.parse_args(["test"]), "png")
-        self.assertEqual(imagegen.extract_image(response, "png", None), data)
+        self.assertEqual(extract(response), data)
 
     def test_request_controls_and_reference(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -128,7 +132,7 @@ class RequestTests(unittest.TestCase):
             reference.write_bytes(image_bytes())
             args = imagegen.parse_args([
                 "--image", str(reference), "--size", "1024x1024", "--quality", "high",
-                "--background", "transparent", "Keep the face unchanged",
+                "--background", "transparent", "--input-fidelity", "high", "Keep the face unchanged",
             ])
             client = MagicMock()
             with patch.dict(os.environ, ENV, clear=True):
@@ -138,7 +142,7 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(request["tool_choice"], "required")
         self.assertEqual(request["tools"], [{
             "type": "image_generation", "output_format": "png", "size": "1024x1024",
-            "quality": "high", "background": "transparent",
+            "quality": "high", "background": "transparent", "input_fidelity": "high",
         }])
         content = request["input"][0]["content"]
         self.assertEqual(content[0]["text"], "Keep the face unchanged")
@@ -175,25 +179,49 @@ class ArtifactTests(unittest.TestCase):
         for image_format in ("png", "jpeg", "webp"):
             with self.subTest(image_format=image_format):
                 data = image_bytes(image_format.upper())
-                self.assertEqual(imagegen.extract_image(response_for(data), image_format, None), data)
+                self.assertEqual(extract(response_for(data), image_format), data)
 
     def test_invalid_base64(self):
         for result in ("!!!!", "aGVsbG8=\n", "", None, "\u2603"):
             with self.subTest(result=result), self.assertRaises(imagegen.GenerationError):
-                imagegen.extract_image(response_for(result=result), "png", None)
+                extract(response_for(result=result))
 
     def test_non_image_bytes(self):
         with self.assertRaises(imagegen.GenerationError):
-            imagegen.extract_image(response_for(b"hello"), "png", None)
+            extract(response_for(b"hello"))
 
-    def test_wrong_format_and_size(self):
+    def test_mismatch_saved_with_warning(self):
+        # Paid output is kept; the deviation is reported on stderr.
         for image_format, size in (("jpeg", None), ("png", "1024x1024")):
-            with self.subTest(image_format=image_format, size=size), self.assertRaises(imagegen.GenerationError):
-                imagegen.extract_image(response_for(), image_format, size)
+            stderr = StringIO()
+            with self.subTest(image_format=image_format, size=size), contextlib.redirect_stderr(stderr):
+                self.assertEqual(extract(response_for(), image_format, size), image_bytes())
+            self.assertIn("IMAGE_GENERATION_WARNING", stderr.getvalue())
 
     def test_requested_size_accepted(self):
         data = image_bytes(size=(1024, 1024))
-        self.assertEqual(imagegen.extract_image(response_for(data), "png", "1024x1024"), data)
+        stderr = StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(extract(response_for(data), "png", "1024x1024"), data)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_multiple_calls_first_completed_saved(self):
+        good = response_for()
+        failed = SimpleNamespace(type="image_generation_call", status="failed", result=None)
+        response = SimpleNamespace(status="completed", output=[failed, good.output[0], good.output[0]])
+        stderr = StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(extract(response), image_bytes())
+        self.assertIn("3 image calls", stderr.getvalue())
+
+    def test_refusal_text_included_in_error(self):
+        message = SimpleNamespace(type="message", content=[
+            SimpleNamespace(type="output_text", text="I can't  draw\nthat."),
+            SimpleNamespace(type="refusal", refusal="Policy."),
+        ])
+        response = SimpleNamespace(status="completed", output=[message])
+        with self.assertRaisesRegex(imagegen.GenerationError, "Model text: I can't draw that. Policy."):
+            extract(response)
 
     def test_missing_failed_pending_and_multiple_calls(self):
         good = response_for()
@@ -202,13 +230,12 @@ class ArtifactTests(unittest.TestCase):
             SimpleNamespace(status="failed", output=good.output),
             SimpleNamespace(status="queued", output=[]),
             SimpleNamespace(status="in_progress", output=[]),
-            SimpleNamespace(status="completed", output=good.output * 2),
             response_for(status="in_progress"),
             response_for(status="failed"),
         ]
         for response in responses:
             with self.subTest(response=response), self.assertRaises(imagegen.GenerationError):
-                imagegen.extract_image(response, "png", None)
+                extract(response)
 
     def test_save_preserves_existing_file_unless_authorized(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -249,12 +276,13 @@ class CommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV, clear=True):
             output = Path(directory) / "nested" / "image.png"
             client = MagicMock()
-            client.__enter__.return_value.responses.create.return_value = response_for()
+            client.__enter__.return_value.responses.create.return_value = response_for(revised_prompt="A green square")
             with patch.object(imagegen, "build_client", return_value=client):
                 code, stdout, stderr = self.run_main(["--output", str(output), "test"])
             self.assertEqual(code, 0, stderr)
             self.assertEqual(output.read_bytes(), image_bytes())
             self.assertIn("gpt-6-astra", stdout)
+            self.assertIn("Revised prompt: A green square", stdout)
             self.assertNotIn(ENV["OPENAI_IMAGE_API_KEY"], stdout + stderr)
 
     def test_bad_payload_leaves_existing_output_untouched(self):
@@ -272,16 +300,21 @@ class CommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, ENV, clear=True):
             existing = Path(directory) / "existing.png"
             existing.touch()
+            folder = Path(directory) / "folder.png"
+            folder.mkdir()
             cases = [
                 ["--output", str(existing), "test"],
+                ["--output", str(folder), "test"],
                 ["--output", str(Path(directory) / "x.gif"), "test"],
                 ["--output", str(Path(directory) / "x.jpg"), "--background", "transparent", "test"],
             ]
             for args in cases:
                 with self.subTest(args=args), patch.object(imagegen, "build_client") as client:
-                    code, _, _ = self.run_main(args)
+                    code, _, stderr = self.run_main(args)
                     self.assertEqual(code, 1)
                     client.assert_not_called()
+                    if args[1] == str(folder):
+                        self.assertIn("is a directory", stderr)
 
     def test_secret_not_echoed_from_upstream_exception(self):
         with patch.dict(os.environ, ENV, clear=True), patch.object(
@@ -302,7 +335,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn("Could not reach", imagegen.safe_error(APIConnectionError(message=secret, request=request)))
 
     def test_bad_timeout_and_empty_prompt(self):
-        for args in (["--timeout", "0", "test"], ["--timeout", "nan", "test"], ["--timeout", "inf", "test"], ["  "]):
+        for args in (["--timeout", "0", "test"], ["--timeout", "nan", "test"], ["--timeout", "inf", "test"], ["  "], ["--input-fidelity", "high", "test"]):
             with self.subTest(args=args), contextlib.redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 imagegen.parse_args(args)
 

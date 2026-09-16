@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["openai>=2.0,<3.0", "Pillow>=12.0,<13.0"]
+# ///
 """Generate or edit an image through an explicitly configured Responses API.
+
+Run with ``uv run generate_image.py ...`` (dependencies resolve from the inline
+metadata above) or with any interpreter that has requirements.txt installed.
 
 Required environment variables (from a connector or the launching environment):
   OPENAI_IMAGE_BASE_URL
@@ -33,6 +40,7 @@ REQUIRED_ENV = (
 )
 FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
+TOOL_OPTIONS = ("size", "background", "quality", "input_fidelity")
 
 
 class GenerationError(Exception):
@@ -44,6 +52,10 @@ class Config:
     base_url: str
     model: str
     api_key: str = field(repr=False)
+
+
+def warn(message: str) -> None:
+    print("IMAGE_GENERATION_WARNING: " + message, file=sys.stderr)
 
 
 def read_config() -> Config:
@@ -127,7 +139,7 @@ def create_request(client: Any, config: Config, args: argparse.Namespace, image_
     content = [{"type": "input_text", "text": args.prompt}]
     content.extend(reference_content(path) for path in args.image)
     tool = {"type": "image_generation", "output_format": image_format}
-    for name in ("size", "background", "quality"):
+    for name in TOOL_OPTIONS:
         value = getattr(args, name)
         if value is not None:
             tool[name] = value
@@ -139,7 +151,21 @@ def create_request(client: Any, config: Config, args: argparse.Namespace, image_
     )
 
 
-def extract_image(response: Any, expected_format: str, expected_size: str | None) -> bytes:
+def model_text(response: Any) -> str:
+    """Assistant text in the response (for example a refusal), trimmed for an error message."""
+    parts = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for chunk in getattr(item, "content", None) or []:
+            text = getattr(chunk, "text", None) or getattr(chunk, "refusal", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(" ".join(text.split()))
+    return " ".join(parts)[:300]
+
+
+def select_call(response: Any) -> Any:
+    """Return the completed image_generation_call to save, or raise a safe error."""
     status = getattr(response, "status", None)
     if status in {"queued", "in_progress"}:
         raise GenerationError(
@@ -153,26 +179,39 @@ def extract_image(response: Any, expected_format: str, expected_size: str | None
         if getattr(item, "type", None) == "image_generation_call"
     ]
     if not calls:
-        raise GenerationError("The response contained no image_generation_call. No image was saved.")
-    if len(calls) != 1:
-        raise GenerationError("Expected one image result; received multiple calls. No image was saved.")
-    call = calls[0]
-    if getattr(call, "status", None) not in {None, "completed"}:
-        raise GenerationError("The image-generation call did not complete. No image was saved.")
-    result = getattr(call, "result", None)
-    if not isinstance(result, str) or not result:
-        raise GenerationError("The image-generation call returned no Base64 image data.")
+        text = model_text(response)
+        raise GenerationError(
+            "The response contained no image_generation_call. No image was saved."
+            + (f" Model text: {text}" if text else "")
+        )
+    completed = [
+        call for call in calls
+        if getattr(call, "status", None) in {None, "completed"}
+        and isinstance(getattr(call, "result", None), str)
+        and call.result
+    ]
+    if not completed:
+        raise GenerationError("No image-generation call completed with Base64 image data. No image was saved.")
+    if len(calls) > 1:
+        warn(f"The model made {len(calls)} image calls; only the first completed one was saved.")
+    return completed[0]
+
+
+def decode_image(call: Any, expected_format: str, expected_size: str | None) -> bytes:
+    """Decode and validate the call's image. Mismatches warn instead of discarding paid output."""
     try:
-        data = base64.b64decode(result, validate=True)
+        data = base64.b64decode(call.result, validate=True)
     except (binascii.Error, ValueError):
         raise GenerationError("The image result was not valid Base64 data.") from None
     image_format, size = inspect_image(data)
     if image_format != expected_format:
-        raise GenerationError("The returned image format does not match the requested output extension.")
+        warn(
+            f"The provider returned {image_format.upper()} data but the output extension requests "
+            f"{expected_format.upper()}; saved unchanged."
+        )
     if expected_size and expected_size != "auto":
-        dimensions = tuple(int(part) for part in expected_size.split("x"))
-        if size != dimensions:
-            raise GenerationError("The returned image dimensions do not match the requested size.")
+        if size != tuple(int(part) for part in expected_size.split("x")):
+            warn(f"The provider returned {size[0]}x{size[1]} instead of the requested {expected_size}; saved anyway.")
     return data
 
 
@@ -230,6 +269,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--size", choices=("auto", "1024x1024", "1536x1024", "1024x1536"))
     parser.add_argument("--background", choices=("auto", "opaque", "transparent"))
     parser.add_argument("--quality", choices=("auto", "low", "medium", "high"))
+    parser.add_argument("--input-fidelity", choices=("high", "low"), help="Reference-image fidelity for edits; requires --image")
     parser.add_argument("--timeout", type=float, default=300, help="SDK request timeout in seconds (default: 300)")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacement of an existing output")
     parser.add_argument("--check-config", action="store_true", help="Validate environment only, without a network call")
@@ -238,6 +278,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("a nonempty prompt is required unless --check-config is used")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be a finite positive number")
+    if args.input_fidelity and not args.image:
+        parser.error("--input-fidelity requires at least one --image")
     return args
 
 
@@ -254,21 +296,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.background == "transparent" and image_format == "jpeg":
             raise GenerationError("Transparent backgrounds require PNG or WebP output.")
         output = args.output.expanduser().absolute()
-        if os.path.lexists(output) and not args.overwrite:
-            raise GenerationError("Output already exists. Choose a new path or use --overwrite.")
         if output.is_dir():
             raise GenerationError("Output is a directory. Choose an image file path.")
+        if os.path.lexists(output) and not args.overwrite:
+            raise GenerationError("Output already exists. Choose a new path or use --overwrite.")
         # Check decoder availability before making a potentially billable request.
         from PIL import Image  # noqa: F401
 
         with build_client(config, args.timeout) as client:
             response = create_request(client, config, args, image_format)
-        data = extract_image(response, image_format, args.size)
+        call = select_call(response)
+        data = decode_image(call, image_format, args.size)
         save_image(output, data, args.overwrite)
     except Exception as exc:
         print("IMAGE_GENERATION_ERROR: " + safe_error(exc), file=sys.stderr)
         return 1
     print(f"Generated {output} using model {config.model}")
+    revised = getattr(call, "revised_prompt", None)
+    if isinstance(revised, str) and revised.strip() and revised.strip() != args.prompt.strip():
+        print("Revised prompt: " + revised.strip())
     return 0
 
 

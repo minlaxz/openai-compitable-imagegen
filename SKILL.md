@@ -23,11 +23,12 @@ The helper requires all three variables. It does not load `.env` files, infer an
 
 The URL must not contain credentials, query parameters, or fragments. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_API_BASE` are deliberately ignored to avoid mixing credentials from unrelated services.
 
-### Manus AI: load OpenAI Image Connector
+### Manus AI: OpenAI Image Connector
 
-For image-generation and semantic image-editing requests, load or enable the user's existing connector named **OpenAI Image Connector** through Manus's supported connector workflow before running the helper. Use that connector to supply the three `OPENAI_IMAGE_*` variables in the same task runtime that executes the helper. The Python helper consumes those variables; it does not load the connector or call a connector API itself.
-
-Do not assume the connector is already enabled or that its default variable names match these names. Its Note is usage guidance, not an executable environment-variable mapping. If the connector uses different names, configure its secure environment mapping through the host's supported configuration workflow. If that mapping is unavailable, ask the user to configure these three variables through the host's secret/environment mechanism. Do not print connector configuration, invent a connector command, hard-code a connector UID, create a duplicate connector, or substitute an unrelated OpenAI connector.
+1. Enable the user's existing connector named **OpenAI Image Connector** through Manus's connector workflow. Do not create a duplicate, hard-code a connector UID, or substitute an unrelated OpenAI connector.
+2. Run the helper with `--check-config` in the task sandbox.
+3. If it passes, the connector injected the three `OPENAI_IMAGE_*` variables into the sandbox. Run the helper normally.
+4. If it reports missing variables, the connector exposes a tool rather than environment variables. Generate through that connector tool directly and skip the helper, or ask the user once to map the three variable names through Manus's secure configuration. Never ask for the key in chat.
 
 ### Pi, Codex, Claude, and other agents: launching environment
 
@@ -35,24 +36,32 @@ The helper inherits the three variables from its parent process. For a shell-lau
 
 Use the same helper and variable names on every host. No host detection or credential fallback is needed.
 
+Codex note: Codex's `shell_environment_policy` can strip variables whose names contain `KEY`, `SECRET`, or `TOKEN` (when `ignore_default_excludes = false`, or `inherit` is `"core"` or `"none"`). `OPENAI_IMAGE_API_KEY` matches. If `--check-config` reports it missing while the shell has it, fix `~/.codex/config.toml`, not the skill.
+
 ### Secret handling
 
 Never put the real key in a prompt, skill file, source file, command argument, shell-history entry, log, attachment, or final response. Do not use `env`, `printenv`, shell tracing, or commands that display the variables' values. If configuration is missing, identify the missing variable names and ask for secure configuration, not for a key pasted into chat. Do not reuse a key the user has asked to rotate.
 
 ## Setup and preflight
 
-Requirements: Python 3.10+ and the packages in `requirements.txt`. Resolve `SKILL_DIR` to this skill's actual directory from its loaded path/metadata. Do not assume `/home/ubuntu`, a particular agent installation directory, or the current working directory.
+Requirements: Python 3.10+, `openai`, and `Pillow`. The script declares them inline (PEP 723) and `requirements.txt` lists the same pins. Resolve `SKILL_DIR` to this skill's actual directory from its loaded path/metadata. Do not assume `/home/ubuntu`, a particular agent installation directory, or the current working directory.
 
-Use an existing Python environment with the dependencies when available. Otherwise create an isolated environment in a writable location, following the host's installation and network-approval rules. For example, when the skill directory is writable:
+Preferred when `uv` is available; it resolves and caches the dependencies itself:
 
 ```bash
 # SKILL_DIR is the actual directory containing this SKILL.md.
+uv run "$SKILL_DIR/scripts/generate_image.py" --check-config
+```
+
+Without `uv`: use an existing Python environment that already has the dependencies, or create one in a writable location following the host's installation and network-approval rules:
+
+```bash
 python3 -m venv "$SKILL_DIR/.venv"
 "$SKILL_DIR/.venv/bin/python" -m pip install -r "$SKILL_DIR/requirements.txt"
 "$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/scripts/generate_image.py" --check-config
 ```
 
-On Windows, a virtual environment's interpreter is under `Scripts/python.exe` rather than `bin/python`. Use the selected interpreter for every helper call. `--check-config` works without the optional packages installed; it reports only configuration presence and URL structure. It does not authenticate or make a network request.
+On Windows a virtual environment's interpreter is under `Scripts/python.exe`. Use the same launcher (`uv run ...` or the selected interpreter) for every helper call; the examples below write `python3` for brevity. `--check-config` works without the optional packages installed; it reports only configuration presence and URL structure. It does not authenticate or make a network request.
 
 ## Generation workflow
 
@@ -60,7 +69,7 @@ On Windows, a virtual environment's interpreter is under `Scripts/python.exe` ra
 2. **Prepare the prompt.** Keep the user's intent and required wording. Add framing, lighting, palette, material, and exclusions only when helpful. For edits, explicitly state what must stay unchanged; generative edits do not guarantee pixel-perfect preservation.
 3. **Select output and controls.** Choose a writable workspace output path. The extension selects PNG, JPEG, or WebP. Pass explicit size, background, and quality controls when requested and supported. The helper supports the standard sizes below; for other ratios, describe the desired framing and disclose any approximation rather than promising an exact size.
 4. **Run the bundled helper.** It sends the configured model to `/responses`, declares the `image_generation` tool, and requires tool use. Do not rewrite API or Base64 extraction code for ordinary generation or reference-image requests.
-5. **Validate visually.** The helper checks Base64, actual image format, decodability, and explicitly requested dimensions before publishing the file. Open the resulting image with the host's image-viewing capability to check required wording, composition, and edit constraints. If visual inspection is unavailable, say so; do not claim it was performed. Avoid endless subjective refinement.
+5. **Validate visually.** The helper checks Base64 and decodability before saving. A size or format mismatch, or more than one image call, is still saved but reported as an `IMAGE_GENERATION_WARNING:` line on stderr; read stderr and disclose the deviation. On success the helper prints a `Revised prompt:` line when the orchestrating model rewrote the prompt; compare it against required wording. Open the resulting image with the host's image-viewing capability to check required wording, composition, and edit constraints. If visual inspection is unavailable, say so; do not claim it was performed. Avoid endless subjective refinement.
 6. **Deliver the artifact.** Attach or expose the generated file using the host's supported artifact mechanism. If attachments are unavailable, provide the output path. Identify the configured model and say the compatible endpoint was used. Do not deliver raw response JSON, Base64, or credentials.
 
 ### New image
@@ -83,7 +92,7 @@ python3 "$SKILL_DIR/scripts/generate_image.py" \
   -- "Change only the jacket to dark green. Preserve the person's face, pose, and background."
 ```
 
-`--image` accepts local PNG, JPEG, or WebP files up to 20 MiB each and may be repeated. The helper validates and sends them as `input_image` data URLs to the configured provider. Only send references authorized for that provider. Mask-based editing is not implemented.
+`--image` accepts local PNG, JPEG, or WebP files up to 20 MiB each and may be repeated. The helper validates and sends them as `input_image` data URLs to the configured provider. Add `--input-fidelity high` when faces, logos, or fine details must survive the edit. Only send references authorized for that provider. Mask-based editing is not implemented.
 
 ### Helper controls
 
@@ -91,11 +100,12 @@ python3 "$SKILL_DIR/scripts/generate_image.py" \
 - `--size`: `auto`, `1024x1024`, `1536x1024`, or `1024x1536`.
 - `--background`: `auto`, `opaque`, or `transparent`; transparency requires PNG or WebP.
 - `--quality`: `auto`, `low`, `medium`, or `high`.
+- `--input-fidelity`: `high` or `low`; requires `--image`. `high` preserves reference details more closely.
 - `--timeout SECONDS`: positive SDK request timeout; default 300 seconds, not a guaranteed total wall-clock deadline.
 - `--overwrite`: explicitly allow replacing an existing output; without this flag existing files are protected.
 - `--check-config`: offline configuration validation; no prompt required.
 
-Size, background, and quality are omitted from the API request unless supplied. Optional controls depend on provider support. Do not silently remove a user-required control if the endpoint rejects it. The helper handles one synchronous image result per invocation, with automatic SDK retries disabled to reduce duplicate paid requests. It does not poll asynchronous responses or switch providers.
+Size, background, quality, and input fidelity are omitted from the API request unless supplied. Optional controls depend on provider support. Do not silently remove a user-required control if the endpoint rejects it. The helper handles one synchronous image result per invocation, with automatic SDK retries disabled to reduce duplicate paid requests. It does not poll asynchronous responses or switch providers.
 
 ## Failure handling and fallback
 
@@ -104,7 +114,7 @@ Size, background, and quality are omitted from the API request unless supplied. 
 - **Model, endpoint, or tool unsupported:** check configured settings and provider documentation through available approved tools. Change the model only with user authorization; do not assume `gpt-6-astra` exists on other services.
 - **Rate limit, timeout, connection failure, or server error:** do not automatically resubmit. The original request may have been accepted and may still incur a charge. Explain the uncertainty before another attempt.
 - **Pending response:** the helper does not poll. Follow the provider's documented retrieval workflow if available and authorized, rather than starting another generation. Do not invent a polling protocol or print entire responses to diagnose it.
-- **Text-only, failed, empty, malformed, or mismatched image output:** report that no valid artifact was saved. A text-only response does not prove the provider can never generate images.
+- **Text-only, failed, empty, or malformed image output:** report that no valid artifact was saved. For a text-only response the error includes a short `Model text:` excerpt (often a refusal); relay it. A text-only response does not prove the provider can never generate images.
 - **Alternative route:** use a different provider or built-in image tool only if it is actually available and the user has already permitted that fallback or approves it now. Preserve the prompt, disclose the switch, and consider reference-image privacy and cost. If no approved fallback exists, stop with a concise explanation.
 
 Do not use this skill for audio, video, or unrelated text generation.
@@ -114,6 +124,8 @@ Do not use this skill for audio, video, or unrelated text generation.
 With the dependencies installed in the selected Python environment:
 
 ```bash
+uv run --with openai --with Pillow python -m unittest discover -s "$SKILL_DIR/tests" -v
+# or, with the selected interpreter:
 python3 -m unittest discover -s "$SKILL_DIR/tests" -v
 ```
 
