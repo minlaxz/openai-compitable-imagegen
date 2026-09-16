@@ -1,1 +1,8 @@
 .DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+artifacts/
+generated_image.*

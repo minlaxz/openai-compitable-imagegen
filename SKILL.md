@@ -1,77 +1,120 @@
 ---
 name: openai-compatible-imagegen
-description: "Generate and edit visual assets through the user's OpenAI-compatible endpoint before using the built-in image-generation route. Use for image-generation requests, image concepts, illustrations, posters, product visuals, UI mockups, character art, and image edits when the user's compatible endpoint and credentials are available."
+description: "Generate and edit images through the user's configured OpenAI-compatible Responses API. Use for illustrations, posters, product visuals, UI mockups, character art, and semantic image edits. Prefer this route when OPENAI_IMAGE_BASE_URL, OPENAI_IMAGE_MODEL, and OPENAI_IMAGE_API_KEY are supplied by a connector or the agent's environment."
 ---
 
 # OpenAI-Compatible Image Generation
 
 ## Purpose
 
-Use the user's OpenAI-compatible endpoint as the **first-class image-generation route**. Do not ask the user to repeat this routing preference, endpoint, or model choice during ordinary image requests. The preferred model is `gpt-6-astra`; it is expected to invoke image generation through the Responses API rather than calling `gpt-image-2` directly.
+Use the user's configured endpoint as the preferred image-generation route. Their provider supports `gpt-6-astra` with the Responses API `image_generation` tool under the hood. This is a provider-specific capability, not a promise that every OpenAI-compatible service supports it. Use `OPENAI_IMAGE_MODEL` as configured; do not substitute `gpt-image-2` or silently switch models.
 
-This skill complements, rather than replaces, the general image-generation workflow. Continue to classify the request, decide the right aspect ratio and composition, write a strong prompt, and perform a lightweight visual validation. Use deterministic diagrams or plotting when the request requires exact node relationships or numeric fidelity.
+Preserve the user's medium, composition, aspect ratio, transparency, wording, references, and edit constraints. Choose sensible defaults for nonessential details. Do not ask the user to repeat an already configured routing preference or prompt.
 
-## Connector-first configuration
+## Configuration: environment only
 
-When the enabled **Configured OpenAI Connector** is available, use it as the first source of credentials and endpoint settings. In this session, the connector is the enabled `OpenAI` API connector and injects `OPENAI_API_KEY` and `OPENAI_API_BASE` into the task environment. The skill does not need to know or store the connector UID, and it should not create a duplicate connector or ask the user to paste the same credentials again for ordinary image requests.
+The helper requires all three variables. It does not load `.env` files, infer an endpoint, or fall back to generic OpenAI credentials.
 
-Prefer the connector-injected environment over manually supplied values. If the connector is active but the expected variables are unavailable, inspect the current connector configuration through the approved configuration workflow before declaring the service unavailable. If no connector is available, use explicit environment variables or ask the user to configure a secure credential source once.
+| Variable | Meaning |
+| --- | --- |
+| `OPENAI_IMAGE_BASE_URL` | Explicit HTTPS API base URL, normally ending in `/v1`, not `/responses` |
+| `OPENAI_IMAGE_MODEL` | Provider model; set to `gpt-6-astra` for the user's current service |
+| `OPENAI_IMAGE_API_KEY` | Credential belonging to that endpoint |
 
-## Configuration and secret handling
+The URL must not contain credentials, query parameters, or fragments. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_API_BASE` are deliberately ignored to avoid mixing credentials from unrelated services.
 
-Use these values by default:
+### Manus AI: load OpenAI Image Connector
 
-| Setting | Default | Override |
-| --- | --- | --- |
-| API endpoint | `https://router.next-innovations.ltd/v1` | `OPENAI_IMAGE_BASE_URL`, then `OPENAI_BASE_URL`, then `OPENAI_API_BASE` |
-| Model | `gpt-6-astra` | `OPENAI_IMAGE_MODEL` or a task-specific user instruction |
-| Credential | `OPENAI_API_KEY` injected by the Configured OpenAI Connector or supplied through the active environment | Never hard-code, print, attach, or commit the key |
+For image-generation and semantic image-editing requests, load or enable the user's existing connector named **OpenAI Image Connector** through Manus's supported connector workflow before running the helper. Use that connector to supply the three `OPENAI_IMAGE_*` variables in the same task runtime that executes the helper. The Python helper consumes those variables; it does not load the connector or call a connector API itself.
 
-Treat the API key as sensitive. Never put it in a prompt, source file, generated skill, log, command output, or final response. If the key is unavailable in the active environment, ask for it once or ask the user to configure it through the approved secret mechanism. Do not reuse or expose a key that the user has asked to rotate.
+Do not assume the connector is already enabled or that its default variable names match these names. Its Note is usage guidance, not an executable environment-variable mapping. If the connector uses different names, configure its secure environment mapping through the host's supported configuration workflow. If that mapping is unavailable, ask the user to configure these three variables through the host's secret/environment mechanism. Do not print connector configuration, invent a connector command, hard-code a connector UID, create a duplicate connector, or substitute an unrelated OpenAI connector.
 
-## Routing workflow
+### Pi, Codex, Claude, and other agents: launching environment
 
-1. **Classify the request.** For a new image, illustration, poster, product visual, character, UI mockup, or semantic image edit, use this skill first. Preserve the user's requested medium, aspect ratio, transparency, text, references, and edit constraints.
+The helper inherits the three variables from its parent process. For a shell-launched agent, export them before launching the agent. For an app, remote worker, or sandbox, configure them in the environment that actually runs the helper; an export in an unrelated terminal will not update an already running process. Restart the agent/task when necessary after changing its environment.
 
-2. **Keep the original intent.** Convert the user's request into a concise image prompt. Add useful composition, lighting, camera/framing, palette, material, and exclusion details only when they improve correctness. If nonessential details are missing, choose reasonable defaults and proceed rather than asking the user to restate the whole request.
+Use the same helper and variable names on every host. No host detection or credential fallback is needed.
 
-3. **Call the compatible endpoint.** Send a Responses API request to the configured endpoint with `model: "gpt-6-astra"`, the user's image prompt as `input`, and the image-generation tool:
+### Secret handling
 
-   ```json
-   {
-     "model": "gpt-6-astra",
-     "tools": [{"type": "image_generation"}],
-     "input": [{
-       "role": "user",
-       "content": [{"type": "input_text", "text": "<image prompt>"}]
-     }]
-   }
-   ```
+Never put the real key in a prompt, skill file, source file, command argument, shell-history entry, log, attachment, or final response. Do not use `env`, `printenv`, shell tracing, or commands that display the variables' values. If configuration is missing, identify the missing variable names and ask for secure configuration, not for a key pasted into chat. Do not reuse a key the user has asked to rotate.
 
-   Do not substitute `gpt-image-2` for this route. The compatible model is responsible for invoking the image capability under the hood.
+## Setup and preflight
 
-4. **Extract the artifact.** Find the response output item whose type is `image_generation_call`. Decode its Base64 `result` into the requested image format, normally PNG. Do not deliver the raw JSON response. If there is no result, inspect the call status and error. If the endpoint requires polling, follow its documented response behavior; otherwise report the failure and use the built-in image route only as a transparent fallback.
+Requirements: Python 3.10+ and the packages in `requirements.txt`. Resolve `SKILL_DIR` to this skill's actual directory from its loaded path/metadata. Do not assume `/home/ubuntu`, a particular agent installation directory, or the current working directory.
 
-5. **Validate lightly.** Confirm that the output exists, opens as an image, has the requested aspect ratio or a reasonable square default, and has no obvious fatal defect. For text-bearing visuals, check only the user-required wording. Do not perform endless subjective refinement.
-
-6. **Deliver directly.** Attach the final image file. State that it was generated through the compatible endpoint and identify the model used, but never disclose the endpoint credential. If the custom route fails and a built-in fallback is used, say so briefly without asking the user to repeat the prompt.
-
-## Reusable helper
-
-For a normal new-image request, prefer the bundled helper instead of rewriting request and Base64-extraction logic:
+Use an existing Python environment with the dependencies when available. Otherwise create an isolated environment in a writable location, following the host's installation and network-approval rules. For example, when the skill directory is writable:
 
 ```bash
-python /home/ubuntu/skills/openai-compatible-imagegen/scripts/generate_image.py \
-  --output /home/ubuntu/generated_image.png \
-  "<image prompt>"
+# SKILL_DIR is the actual directory containing this SKILL.md.
+python3 -m venv "$SKILL_DIR/.venv"
+"$SKILL_DIR/.venv/bin/python" -m pip install -r "$SKILL_DIR/requirements.txt"
+"$SKILL_DIR/.venv/bin/python" "$SKILL_DIR/scripts/generate_image.py" --check-config
 ```
 
-The helper reads `OPENAI_API_KEY`, defaults to the endpoint and model above, accepts compatible endpoint overrides, and saves the returned image as a PNG. Use it only when the active environment contains the credential. For image edits or image inputs, adapt the Responses API input content to include the relevant `input_image` or file reference while preserving unchanged regions as instructed by the user.
+On Windows, a virtual environment's interpreter is under `Scripts/python.exe` rather than `bin/python`. Use the selected interpreter for every helper call. `--check-config` works without the optional packages installed; it reports only configuration presence and URL structure. It does not authenticate or make a network request.
 
-## Failure handling
+## Generation workflow
 
-If the endpoint returns an authentication or permission error, do not retry repeatedly. Report that the custom route is unavailable, check whether the key or model is configured, and then offer the built-in image route as a fallback without making the user restate the prompt. If the endpoint returns a model-not-found error, list or inspect available models when permitted; prefer `gpt-6-astra` and only use another model when the user explicitly accepts it or the endpoint documents it as an equivalent image-capable model. If the endpoint returns a successful text response but no image-generation call, treat that as unsupported image generation rather than pretending an image was created.
+1. **Classify the request.** Use this skill for visual assets and semantic image edits. Use deterministic rendering instead for exact charts, numeric plots, formal diagrams, or exact node relationships.
+2. **Prepare the prompt.** Keep the user's intent and required wording. Add framing, lighting, palette, material, and exclusions only when helpful. For edits, explicitly state what must stay unchanged; generative edits do not guarantee pixel-perfect preservation.
+3. **Select output and controls.** Choose a writable workspace output path. The extension selects PNG, JPEG, or WebP. Pass explicit size, background, and quality controls when requested and supported. The helper supports the standard sizes below; for other ratios, describe the desired framing and disclose any approximation rather than promising an exact size.
+4. **Run the bundled helper.** It sends the configured model to `/responses`, declares the `image_generation` tool, and requires tool use. Do not rewrite API or Base64 extraction code for ordinary generation or reference-image requests.
+5. **Validate visually.** The helper checks Base64, actual image format, decodability, and explicitly requested dimensions before publishing the file. Open the resulting image with the host's image-viewing capability to check required wording, composition, and edit constraints. If visual inspection is unavailable, say so; do not claim it was performed. Avoid endless subjective refinement.
+6. **Deliver the artifact.** Attach or expose the generated file using the host's supported artifact mechanism. If attachments are unavailable, provide the output path. Identify the configured model and say the compatible endpoint was used. Do not deliver raw response JSON, Base64, or credentials.
 
-## Scope boundary
+### New image
 
-Use this skill for visual asset generation and semantic image editing. Do not use it for exact charts, formal Mermaid/architecture diagrams, or numeric plots where deterministic rendering is required. Do not use it for audio, video, or unrelated text generation.
+Using the selected Python interpreter (`python3` here):
+
+```bash
+python3 "$SKILL_DIR/scripts/generate_image.py" \
+  --output ./artifacts/poster.png \
+  --size 1024x1536 \
+  -- "A portrait-format travel poster with the exact title: NIGHT TRAIN"
+```
+
+### Reference image or semantic edit
+
+```bash
+python3 "$SKILL_DIR/scripts/generate_image.py" \
+  --image ./reference.png \
+  --output ./artifacts/edited.png \
+  -- "Change only the jacket to dark green. Preserve the person's face, pose, and background."
+```
+
+`--image` accepts local PNG, JPEG, or WebP files up to 20 MiB each and may be repeated. The helper validates and sends them as `input_image` data URLs to the configured provider. Only send references authorized for that provider. Mask-based editing is not implemented.
+
+### Helper controls
+
+- `--output PATH`: default `generated_image.png`; `.png`, `.jpg`, `.jpeg`, or `.webp` selects the requested format.
+- `--size`: `auto`, `1024x1024`, `1536x1024`, or `1024x1536`.
+- `--background`: `auto`, `opaque`, or `transparent`; transparency requires PNG or WebP.
+- `--quality`: `auto`, `low`, `medium`, or `high`.
+- `--timeout SECONDS`: positive SDK request timeout; default 300 seconds, not a guaranteed total wall-clock deadline.
+- `--overwrite`: explicitly allow replacing an existing output; without this flag existing files are protected.
+- `--check-config`: offline configuration validation; no prompt required.
+
+Size, background, and quality are omitted from the API request unless supplied. Optional controls depend on provider support. Do not silently remove a user-required control if the endpoint rejects it. The helper handles one synchronous image result per invocation, with automatic SDK retries disabled to reduce duplicate paid requests. It does not poll asynchronous responses or switch providers.
+
+## Failure handling and fallback
+
+- **Missing configuration:** stop before making a request; use the relevant connector or launching-environment setup above. Ask once for secure configuration, never the secret itself.
+- **Authentication or permissions:** stop and report the safe error category. Do not retry repeatedly or dump upstream error bodies.
+- **Model, endpoint, or tool unsupported:** check configured settings and provider documentation through available approved tools. Change the model only with user authorization; do not assume `gpt-6-astra` exists on other services.
+- **Rate limit, timeout, connection failure, or server error:** do not automatically resubmit. The original request may have been accepted and may still incur a charge. Explain the uncertainty before another attempt.
+- **Pending response:** the helper does not poll. Follow the provider's documented retrieval workflow if available and authorized, rather than starting another generation. Do not invent a polling protocol or print entire responses to diagnose it.
+- **Text-only, failed, empty, malformed, or mismatched image output:** report that no valid artifact was saved. A text-only response does not prove the provider can never generate images.
+- **Alternative route:** use a different provider or built-in image tool only if it is actually available and the user has already permitted that fallback or approves it now. Preserve the prompt, disclose the switch, and consider reference-image privacy and cost. If no approved fallback exists, stop with a concise explanation.
+
+Do not use this skill for audio, video, or unrelated text generation.
+
+## Offline helper tests
+
+With the dependencies installed in the selected Python environment:
+
+```bash
+python3 -m unittest discover -s "$SKILL_DIR/tests" -v
+```
+
+Tests use dummy configuration and mocked API calls; they do not contact the provider or incur generation charges.
